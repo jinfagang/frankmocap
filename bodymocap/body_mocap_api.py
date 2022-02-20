@@ -7,14 +7,17 @@ import numpy as np
 import pickle
 from torchvision.transforms import Normalize
 
-from bodymocap.models import hmr, SMPL, SMPLX
+from bodymocap.models import hmr, SMPLX
 from bodymocap import constants
 from bodymocap.utils.imutils import crop, crop_bboxInfo, process_image_bbox, process_image_keypoints, bbox_from_keypoints
 from mocap_utils.coordconv import convert_smpl_to_bbox, convert_bbox_to_oriIm
 import mocap_utils.geometry_utils as gu
-from alfred.dl.torch.common import device
+from alfred.dl.torch.common import device, print_shape
 import os
 from .utils.utils import ORTWrapper
+from nosmpl.smpl import SMPL
+
+from .constants import JOINT_MAP, JOINT_NAMES
 
 torch.set_grad_enabled(False)
 
@@ -34,9 +37,26 @@ class BodyMocap(object):
             self.use_smplx = True
         else:
             smplModelPath = smpl_dir + '/basicModel_neutral_lbs_10_207_0_v1.0.0.pkl'
-            self.smpl = SMPL(smplModelPath, batch_size=1,
-                             create_transl=False).to(self.device)
+            # self.smpl = SMPL(smplModelPath, batch_size=1,
+            #                  create_transl=False).to(self.device)
+            smpl_onnx_file = smplModelPath.replace('pkl', 'onnx')
+            self.joints_map = [constants.JOINT_MAP[i] for i in constants.JOINT_NAMES]
             self.use_smplx = False
+            if os.path.exists(smpl_onnx_file):
+                self.onnx_smpl = True
+                self.smpl = ORTWrapper(smpl_onnx_file)
+            else:
+                self.onnx_smpl = False
+                self.smpl = SMPL(smplModelPath, extra_regressor='extra_data/body_module/data_from_spin/J_regressor_extra.npy').to(self.device)
+                self.joints_map = torch.as_tensor(self.joints_map).to(device)
+
+                a = torch.rand([1, 10]).to(device)
+                b = torch.rand([1, 24, 3, 3]).to(device)
+                torch.onnx.export(self.smpl, (a, b),
+                                smpl_onnx_file,
+                                output_names=['verts', 'joints', 'faces'],
+                                opset_version=12)
+                print('an onnx saved into: ', smpl_onnx_file)
 
         # Load pre-trained neural network
         SMPL_MEAN_PARAMS = './extra_data/body_module/data_from_spin/smpl_mean_params.npz'
@@ -98,26 +118,49 @@ class BodyMocap(object):
                 pred_rotmat, pred_betas, pred_camera = self.model_regressor(
                     norm_img.to(self.device))
 
-            pred_rotmat = torch.as_tensor(pred_rotmat).to(device)
-            pred_betas = torch.as_tensor(pred_betas).to(device)
-            pred_camera = torch.as_tensor(pred_camera).to(device)
+                pred_rotmat = torch.as_tensor(pred_rotmat).to(device)
+                pred_betas = torch.as_tensor(pred_betas).to(device)
+                pred_camera = torch.as_tensor(pred_camera).to(device)
 
             # Convert rot_mat to aa since hands are always in aa
             # pred_aa = rotmat3x3_to_angle_axis(pred_rotmat)
             # pred_aa = gu.rotation_matrix_to_angle_axis(pred_rotmat).cuda()
-            pred_aa = gu.rotation_matrix_to_angle_axis(pred_rotmat).to(device)
-            pred_aa = pred_aa.reshape(pred_aa.shape[0], 72)
-            smpl_output = self.smpl(
-                betas=pred_betas,
-                body_pose=pred_aa[:, 3:],
-                global_orient=pred_aa[:, :3],
-                pose2rot=True)
-            pred_vertices = smpl_output.vertices
-            pred_joints_3d = smpl_output.joints
+            # pred_aa = gu.rotation_matrix_to_angle_axis(pred_rotmat).to(device)
+            # pred_aa = pred_aa.reshape(pred_aa.shape[0], 72)
+            # smpl_output = self.smpl(
+            #     betas=pred_betas,
+            #     body_pose=pred_aa[:, 3:],
+            #     global_orient=pred_aa[:, :3],
+            #     pose2rot=True)
+            # pred_vertices = smpl_output.vertices
+            # pred_joints_3d = smpl_output.joints
+            
+            if self.onnx_smpl:
+                preds = self.smpl.infer(
+                    [pred_betas, pred_rotmat]
+                )
+                pred_vertices = preds['verts'] 
+                pred_joints_3d = preds['joints']
+                faces = preds['faces']
+                pred_joints_3d = pred_joints_3d[:, self.joints_map, :]
+                pred_vertices = pred_vertices[0]
+                pred_joints_3d = pred_joints_3d[0]
+                print_shape(pred_vertices, pred_joints_3d)
+                pred_camera = pred_camera.ravel()
+            else:
+                print_shape(pred_betas, pred_rotmat)
+                pred_vertices, pred_joints_3d, faces = self.smpl(
+                    pred_betas, pred_rotmat
+                )
+                pred_joints_3d = pred_joints_3d[:, self.joints_map, :]
 
-            pred_vertices = pred_vertices[0].cpu().numpy()
+                pred_vertices = pred_vertices[0].cpu().numpy()
+                pred_camera = pred_camera.cpu().numpy().ravel()
+                pred_joints_3d = pred_joints_3d[0].cpu().numpy()  # (1,49,3)
 
-            pred_camera = pred_camera.cpu().numpy().ravel()
+                pred_rotmat = pred_rotmat.cpu().numpy()
+                faces = faces.cpu().numpy()
+
             camScale = pred_camera[0]  # *1.15
             camTrans = pred_camera[1:]
 
@@ -131,7 +174,6 @@ class BodyMocap(object):
                 pred_vertices_bbox, boxScale_o2n, bboxTopLeft, img_original.shape[1], img_original.shape[0])
 
             # Convert joint to original image space (X,Y are aligned to image)
-            pred_joints_3d = pred_joints_3d[0].cpu().numpy()  # (1,49,3)
             pred_joints_vis = pred_joints_3d[:, :3]  # (49,3)
             pred_joints_vis_bbox = convert_smpl_to_bbox(
                 pred_joints_vis, camScale, camTrans)
@@ -141,26 +183,23 @@ class BodyMocap(object):
             # Output
             pred_output['img_cropped'] = img[:, :, ::-1]
             # SMPL vertex in original smpl space
-            pred_output['pred_vertices_smpl'] = smpl_output.vertices[0].cpu().numpy()
+            pred_output['pred_vertices_smpl'] = pred_vertices
             # SMPL vertex in image space
             pred_output['pred_vertices_img'] = pred_vertices_img
             # SMPL joints in image space
             pred_output['pred_joints_img'] = pred_joints_vis_img
 
             pred_aa_tensor = gu.rotation_matrix_to_angle_axis(
-                pred_rotmat.detach().cpu()[0])
-            pred_output['pred_body_pose'] = pred_aa_tensor.cpu(
-            ).numpy().reshape(1, 72)  # (1, 72)
+                pred_rotmat[0])
+            pred_output['pred_body_pose'] = pred_aa_tensor.reshape(1, 72)  # (1, 72)
 
-            pred_output['pred_rotmat'] = pred_rotmat.detach(
-            ).cpu().numpy()  # (1, 24, 3, 3)
-            pred_output['pred_betas'] = pred_betas.detach(
-            ).cpu().numpy()  # (1, 10)
+            pred_output['pred_rotmat'] = pred_rotmat # (1, 24, 3, 3)
+            pred_output['pred_betas'] = pred_betas  # (1, 10)
 
             pred_output['pred_camera'] = pred_camera
             pred_output['bbox_top_left'] = bboxTopLeft
             pred_output['bbox_scale_ratio'] = boxScale_o2n
-            pred_output['faces'] = self.smpl.faces
+            pred_output['faces'] = faces
 
             if self.use_smplx:
                 img_center = np.array(

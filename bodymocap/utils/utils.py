@@ -22,8 +22,10 @@ class ORTWrapper:
 
         # todo: extract possible input hw for vision models
 
-    def infer(self, imgs):
-        inputs = [imgs]
+    def infer(self, inputs):
+        if not isinstance(inputs, list):
+            # incase users may input single img
+            inputs = [inputs]
         assert len(inputs) == len(self.ort_session.get_inputs()
                                   ), 'inputs must same with model.'
         ort_inputs = dict(
